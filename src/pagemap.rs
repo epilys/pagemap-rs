@@ -1,6 +1,8 @@
+use std::convert::TryInto;
 use std::fmt;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::os::fd::{AsRawFd, RawFd};
 
 use crate::{
     error::{PageMapError, Result},
@@ -279,6 +281,22 @@ impl PageMap {
                 })
                 .ok(),
         );
+        unsafe {
+            libc::posix_fadvise64(
+                kcf.as_ref().unwrap().as_raw_fd(),
+                0,
+                128 * 128 * 0x1000,
+                libc::POSIX_FADV_WILLNEED,
+            )
+        };
+        unsafe {
+            libc::posix_fadvise64(
+                kff.as_ref().unwrap().as_raw_fd(),
+                0,
+                128 * 128 * 0x1000,
+                libc::POSIX_FADV_WILLNEED,
+            )
+        };
         let (maps_path, pagemap_path) = (
             format!("/proc/{}/maps", pid),
             format!("/proc/{}/pagemap", pid),
@@ -327,26 +345,32 @@ impl PageMap {
     /// Returns the entries parsed from reading `/proc/<PID>/pagemap` for all pages in the
     /// specified [`VirtualMemoryArea`] of the process at hand.
     pub fn pagemap_vma(&mut self, vma: &VirtualMemoryArea) -> Result<Vec<PageMapEntry>> {
-        let mut buf = [0; 8];
-        (vma.start..vma.end)
-            .step_by(self.page_size as usize)
-            .map(|addr: u64| -> Result<_> {
-                let vpn = addr / self.page_size;
-                self.pmf
-                    .seek(SeekFrom::Start(vpn * 8))
-                    .map_err(|e| PageMapError::Seek {
-                        path: format!("/proc/{}/pagemap", self.pid),
-                        source: e,
-                    })?;
-                self.pmf
-                    .read_exact(&mut buf)
-                    .map_err(|e| PageMapError::Read {
-                        path: format!("/proc/{}/pagemap", self.pid),
-                        source: e,
-                    })?;
-                Ok(u64::from_ne_bytes(buf).into())
+        let mut buf = vec![
+            0;
+            (8 * (vma.end - vma.start) / self.page_size)
+                .try_into()
+                .unwrap()
+        ];
+        let vpn = vma.start / self.page_size;
+        self.pmf
+            .seek(SeekFrom::Start(vpn * 8))
+            .map_err(|err| PageMapError::Seek {
+                path: format!("/proc/{}/pagemap", self.pid),
+                source: err,
+            })?;
+        self.pmf
+            .read_exact(&mut buf)
+            .map_err(|err| PageMapError::Read {
+                path: format!("/proc/{}/pagemap", self.pid),
+                source: err,
+            })?;
+        Ok(buf
+            .chunks(8)
+            .map(|b| {
+                let c: &[u8; 8] = &b[0..8].try_into().unwrap();
+                u64::from_ne_bytes(*c).into()
             })
-            .collect::<Result<_>>()
+            .collect::<Vec<PageMapEntry>>())
     }
 
     /// Returns the information about memory mappings, as parsed from reading `/proc/<PID>/maps`,
